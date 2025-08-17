@@ -9,10 +9,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 use clap::{Parser, Subcommand};
-use log::{debug, error, info, warn, trace};
+use log::{debug, error, info, warn};
 use ring::rand::{SystemRandom,SecureRandom};
 use serde::{Deserialize, Serialize};
-use tokio::stream;
+
 use tokio::sync::oneshot;
 use url::Url;
 
@@ -88,51 +88,119 @@ impl Default for QuicConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+
+/// Communication protocol enum that defines all message types exchanged between peers.
+/// Each request type has a corresponding response type for clear request/response mapping.
+/// 
+/// ## Request/Response Pairs:
+/// - `PresenceAnnounce` → `PresenceResponse` 
+/// - `FileAnnounce` → `FileAnnounceResponse` (FileAcknowledge)
+/// - `FileRequest` → `FileResponse`
+/// - `FileChunk` → `FileChunkAck`
+/// 
+/// ## Adding New Communication Types:
+/// 1. Add the request variant with a descriptive name ending in "Request" or describing the action
+/// 2. Add the corresponding response variant ending in "Response" or "Ack"
+/// 3. Update the appropriate handler in the MessageHandler implementations
+/// 4. Ensure serialization/deserialization works by testing both directions
+///
+/// ## Example:
+/// ```rust
+/// // New request type
+/// NewFeatureRequest {
+///     param1: String,
+///     param2: u64,
+/// },
+/// // Corresponding response type  
+/// NewFeatureResponse {
+///     success: bool,
+///     result_data: Vec<u8>,
+/// },
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
 enum Communication {
+    // === PRESENCE COMMUNICATION ===
+    /// Request: Announce this peer's presence to the network
     PresenceAnnounce {
         peer_addr: String,
     },
+    /// Response: Acknowledge presence announcement
     PresenceResponse {
         peer_addr: String,
     },
+
+    // === FILE ANNOUNCEMENT COMMUNICATION ===
+    /// Request: Announce that this peer has a file available
     FileAnnounce {
         file_id: String,
         file_name: String,
         file_size: u64,
     },
+    /// Response: Acknowledge file announcement (also serves as FileAnnounceResponse)
     FileAcknowledge {
         file_id: String,
         peer_addr: String,
     },
+
+    // === FILE DISCOVERY COMMUNICATION ===
+    /// Response: List of files available from a peer (sent in response to discovery)
     FileList {
         peer_addr: String,
         files: Vec<(String, String, u64)>, // (file_id, file_name, file_size)
     },
+
+    // === FILE TRANSFER COMMUNICATION ===
+    /// Request: Request a specific file from a peer
     FileRequest {
         file_id: String,
         peer_addr: String,
     },
+    /// Response: Indicate whether the requested file is available
     FileResponse {
         file_id: String,
         available: bool,
         peer_addr: String,
     },
+
+    // === FILE GET COMMUNICATION ===
+    /// Request: Get (download) a specific file from a peer
+    FileGet {
+        file_id: String,
+        peer_addr: String,
+    },
+    /// Response: Return the requested file data or error
+    FileGetResponse {
+        file_id: String,
+        success: bool,
+        file_data: Option<Vec<u8>>,
+        error_message: Option<String>,
+        peer_addr: String,
+    },
+
+    // === FILE CHUNK TRANSFER COMMUNICATION ===
+    /// Request/Data: Send a chunk of file data
     FileChunk {
         file_id: String,
         chunk_index: u64,
         chunk_data: Vec<u8>,
         is_last: bool,
     },
+    /// Response: Acknowledge receipt of a file chunk
     FileChunkAck {
         file_id: String,
         chunk_index: u64,
         peer_addr: String,
     },
+
+    // === FILE TRANSFER COMPLETION ===
+    /// Notification: File transfer completed successfully
     FileTransferComplete {
         file_id: String,
         peer_addr: String,
     },
+
+    // === ERROR HANDLING ===
+    /// Error response: Generic error message for any failed operation
     Error {
         message: String,
     },
@@ -140,147 +208,229 @@ enum Communication {
 
 impl Communication {
     fn serialize(&self) -> Result<Vec<u8>> {
-        bincode::serialize(self).map_err(|e| anyhow!("Serialization error: {}", e))
+        bincode::encode_to_vec(self, bincode::config::standard()).map_err(|e| anyhow!("Serialization error: {}", e))
     }
 
     fn deserialize(data: &[u8]) -> Result<Self> {
-        bincode::deserialize(data).map_err(|e| anyhow!("Deserialization error: {}", e))
+        let (result, _): (Self, usize) = bincode::decode_from_slice(data, bincode::config::standard()).map_err(|e| anyhow!("Deserialization error: {}", e))?;
+        Ok(result)
     }
 }
 
-#[derive(Debug, Clone)]
-struct FileInfo {
-    id: String,
-    name: String,
-    size: u64,
-    path: String,
+
+
+/// Message handler trait for processing different types of communication messages.
+/// Each handler is responsible for a specific category of messages (e.g., presence, files).
+/// 
+/// ## Handler Architecture:
+/// - Handlers are stateless and operate on the provided context
+/// - Each handler should focus on a single concern (Single Responsibility Principle)
+/// - Handlers return `None` for messages they don't handle, allowing other handlers to process them
+/// - Handlers return `Some(response)` when they handle a message and want to send a response
+/// 
+/// ## Creating New Handlers:
+/// 1. Implement the `MessageHandler` trait
+/// 2. Add the handler to the `MessageRouter` in `new()` method
+/// 3. Handle relevant request types and return appropriate responses
+/// 
+/// ## Example Handler:
+/// ```rust
+/// struct MyNewHandler;
+/// 
+/// impl MessageHandler for MyNewHandler {
+///     fn handle_peer_request(&mut self, message: &Communication, context: &mut HandlerContext) -> Result<Option<Communication>> {
+///         match message {
+///             Communication::MyNewRequest { param } => {
+///                 // Process the request
+///                 Ok(Some(Communication::MyNewResponse { result: "processed".to_string() }))
+///             }
+///             _ => Ok(None) // Don't handle other message types
+///         }
+///     }
+///     fn handle_server_side(&mut self, message: &Communication, context: &mut HandlerContext) -> Result<Option<Communication>> {
+///         match message {
+///             Communication::MyNewRequest { param } => {
+///                 // Process the request
+///                 Ok(Some(Communication::MyNewResponse { result: "processed".to_string() }))
+///             }
+///             _ => Ok(None) // Don't handle other message types
+///         }
+///     }
+/// }
+/// ```
+
+
+trait MessageHandler {
+    fn handle_peer_request(&mut self, message: &Communication, context: &mut HandlerContext) -> Result<Option<Communication>>;
+    fn handle_server_request(&mut self, message: &Communication, context: &mut HandlerContext) -> Result<Option<Communication>>;
 }
 
-struct PeerClient {
-    conn: quiche::Connection,
-    socket: std::net::UdpSocket,
-    read_buf: [u8; 65535],
-    scid: Vec<u8>,
-    peer_addr: SocketAddr,
-    stream_responses: HashMap<u64, Vec<u8>>,
-    pending_requests: HashMap<u64, oneshot::Sender<Vec<u8>>>,
-    request_counter: Arc<AtomicU64>,
+/// Context passed to handlers containing transport and session information.
+/// This provides handlers with access to peer state and configuration.
+struct HandlerContext {
+    local_addr: String,
     files: HashMap<String, FileInfo>,
     files_dir: String,
-    local_addr: String,
 }
 
-impl PeerClient {
-    fn new(
-        server_addr: &str,
-        files_dir: String,
-        port: u16,
-        server_cert: Option<String>,
-        no_verify_tls: bool,
-    ) -> Result<Self> {
-        let server_url = if server_addr.starts_with("http") {
-            Url::parse(server_addr)?
-        } else {
-            Url::parse(&format!("https://{}", server_addr))?
-        };
 
-        let peer_addr = server_url
-            .socket_addrs(|| None)?
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow!("No valid address found"))?;
+// Handler for presence announcements
+struct PresenceHandler;
 
-        let bind_addr = match peer_addr {
-            SocketAddr::V4(_) => format!("0.0.0.0:{}", port),
-            SocketAddr::V6(_) => format!("[::]:{}", port),
-        };
-
-        let socket = std::net::UdpSocket::bind(bind_addr)?;
-        socket.set_nonblocking(true)?;
-
-        let mut quic_config = Self::create_quic_config(server_cert, no_verify_tls)?;
-        // Generate a random source connection ID for the connection.
-        let mut scid = [0; quiche::MAX_CONN_ID_LEN];
-        SystemRandom::new().fill(&mut scid[..]).unwrap();
-
-        let local_addr = socket.local_addr()?;
-
-        let conn = quiche::connect(
-            server_url.domain(),
-            &quiche::ConnectionId::from_ref(&scid),
-            local_addr,
-            peer_addr,
-            &mut quic_config,
-        )?;
-
-        let local_addr_str = format!("{}", local_addr);
-        info!("{}:",hex::encode(&scid));
-        Ok(Self {
-            conn,
-            socket,
-            read_buf: [0; 65535],
-            scid: scid.to_vec(),
-            peer_addr,
-            stream_responses: HashMap::new(),
-            pending_requests: HashMap::new(),
-            request_counter: Arc::new(AtomicU64::new(0)),
-            files: HashMap::new(),
-            files_dir,
-            local_addr: local_addr_str,
-        })
-    }
-
-    fn create_quic_config(
-        server_cert: Option<String>,
-        no_verify_tls: bool,
-    ) -> Result<quiche::Config> {
-        let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION)?;
-        let quic_config = QuicConfig::default();
-
-        // Set application protocols (ALPN)
-        config
-            .set_application_protos(&[b"hq-interop", b"hq-29", b"hq-28", b"hq-27", b"http/0.9"])
-            .unwrap();
-
-        config.set_max_idle_timeout(quic_config.max_idle_timeout_ms);
-        config.set_max_recv_udp_payload_size(quic_config.max_recv_udp_payload_size);
-        config.set_max_send_udp_payload_size(quic_config.max_send_udp_payload_size);
-        config.set_initial_max_data(quic_config.initial_max_data);
-        config
-            .set_initial_max_stream_data_bidi_local(quic_config.initial_max_stream_data_bidi_local);
-        config.set_initial_max_stream_data_bidi_remote(
-            quic_config.initial_max_stream_data_bidi_remote,
-        );
-        config.set_initial_max_streams_bidi(quic_config.initial_max_streams_bidi);
-        config.set_initial_max_streams_uni(quic_config.initial_max_streams_uni);
-        config.set_disable_active_migration(true);
-
-        if no_verify_tls {
-            // Disable peer verification (insecure, for development only)
-            config.verify_peer(false);
-            info!("TLS certificate verification disabled - this is insecure!");
-        } else {
-            if let Some(cert_path) = server_cert {
-                // Load the server certificate for verification
-                config.load_verify_locations_from_file(&cert_path)?;
-                info!("Using server certificate: {}", cert_path);
+impl MessageHandler for PresenceHandler {
+    fn handle_peer_request(&mut self, message: &Communication, context: &mut HandlerContext) -> Result<Option<Communication>> {
+        match message {
+            Communication::PresenceAnnounce { peer_addr } => {
+                info!("Peer {} announced presence", peer_addr);
+                Ok(Some(Communication::PresenceResponse {
+                    peer_addr: context.local_addr.clone(),
+                }))
             }
-            // Always enable peer verification when not explicitly disabled
-            config.verify_peer(true);
+            _ => Ok(None)
         }
-
-        Ok(config)
     }
+    fn handle_server_request(&mut self, message: &Communication, context: &mut HandlerContext) -> Result<Option<Communication>> {
+        match message {
+            Communication::PresenceAnnounce { peer_addr } => {
+                info!("Server received presence announcement from {}", peer_addr);
+                Ok(Some(Communication::PresenceResponse {
+                    peer_addr: context.local_addr.clone(),
+                }))
+            }
+            _ => Ok(None)
+        }
+    }
+}
 
-    fn scan_files(&mut self) -> Result<()> {
-        self.files.clear();
+// Handler for file announcements and requests
+struct FileHandler;
 
-        if !Path::new(&self.files_dir).exists() {
-            fs::create_dir_all(&self.files_dir)?;
+impl MessageHandler for FileHandler {
+    fn handle_peer_request(&mut self, message: &Communication, context: &mut HandlerContext) -> Result<Option<Communication>> {
+        match message {
+            Communication::FileAnnounce { file_id, file_name, file_size } => {
+                info!("File announced: {} ({} bytes)", file_name, file_size);
+                Ok(Some(Communication::FileAcknowledge {
+                    file_id: file_id.clone(),
+                    peer_addr: context.local_addr.clone(),
+                }))
+            }
+            Communication::FileRequest { file_id, peer_addr } => {
+                info!("Received file request for {} from {}", file_id, peer_addr);
+                
+                if context.files.contains_key(file_id) {
+                    // TODO: Implement actual file transfer using chunks
+                    Ok(Some(Communication::FileResponse {
+                        file_id: file_id.clone(),
+                        available: true,
+                        peer_addr: context.local_addr.clone(),
+                    }))
+                } else {
+                    Ok(Some(Communication::FileResponse {
+                        file_id: file_id.clone(),
+                        available: false,
+                        peer_addr: context.local_addr.clone(),
+                    }))
+                }
+            }
+            Communication::FileList { peer_addr, .. } => {
+                info!("Received file list request from {}", peer_addr);
+                let files: Vec<(String, String, u64)> = context.files
+                    .values()
+                    .map(|f| (f.id.clone(), f.name.clone(), f.size))
+                    .collect();
+
+                Ok(Some(Communication::FileList {
+                    peer_addr: context.local_addr.clone(),
+                    files,
+                }))
+            }
+            Communication::FileGet { file_id, peer_addr } => {
+                info!("Received file get request for {} from {}", file_id, peer_addr);
+                
+                if let Some(file_info) = context.files.get(file_id) {
+                    // Read the actual file data
+                    match fs::read(&file_info.path) {
+                        Ok(file_data) => Ok(Some(Communication::FileGetResponse {
+                            file_id: file_id.clone(),
+                            success: true,
+                            file_data: Some(file_data),
+                            error_message: None,
+                            peer_addr: context.local_addr.clone(),
+                        })),
+                        Err(e) => Ok(Some(Communication::FileGetResponse {
+                            file_id: file_id.clone(),
+                            success: false,
+                            file_data: None,
+                            error_message: Some(format!("Failed to read file: {}", e)),
+                            peer_addr: context.local_addr.clone(),
+                        }))
+                    }
+                } else {
+                    Ok(Some(Communication::FileGetResponse {
+                        file_id: file_id.clone(),
+                        success: false,
+                        file_data: None,
+                        error_message: Some("File not found".to_string()),
+                        peer_addr: context.local_addr.clone(),
+                    }))
+                }
+            }
+            _ => Ok(None)
+        }
+    }
+    fn handle_server_request(&mut self, message: &Communication, context: &mut HandlerContext) -> Result<Option<Communication>> {
+        // For server-side file handling, we can reuse the same logic as client-side
+        self.handle_peer_request(message, context)
+    }
+}
+
+// Handler for peer lifecycle management including file scanning and announcements
+struct PeerLifecycleHandler;
+
+impl MessageHandler for PeerLifecycleHandler {
+    fn handle_peer_request(&mut self, _message: &Communication, _context: &mut HandlerContext) -> Result<Option<Communication>> {
+        // This handler doesn't handle incoming requests, it's used for utility functions
+        // Other handlers handle the actual incoming requests
+        Ok(None)
+    }
+    fn handle_server_request(&mut self, message: &Communication, context: &mut HandlerContext) -> Result<Option<Communication>> {
+        match message {
+            Communication::PresenceAnnounce { peer_addr } => {
+                info!("Server received presence announcement from {}", peer_addr);
+                // Scan files and announce them
+                Self::scan_files(context)?;
+                let announcements = Self::get_file_announcements(context);
+                Ok(Some(Communication::FileList {
+                    peer_addr: context.local_addr.clone(),
+                    files: announcements.into_iter().map(|f| {
+                        match f {
+                            Communication::FileAnnounce { file_id, file_name, file_size } => (file_id, file_name, file_size),
+                            _ => unreachable!(), // get_file_announcements only returns FileAnnounce variants
+                        }
+                    }).collect(),
+                }))
+            }
+            _ => Ok(None)
+        }
+    }
+}
+
+impl PeerLifecycleHandler {
+    /// Scan files in the peer's directory and update the context
+    fn scan_files(context: &mut HandlerContext) -> Result<()> {
+        context.files.clear();
+
+        if context.files_dir.is_empty() {
             return Ok(());
         }
 
-        for entry in fs::read_dir(&self.files_dir)? {
+        if !Path::new(&context.files_dir).exists() {
+            fs::create_dir_all(&context.files_dir)?;
+            return Ok(());
+        }
+
+        for entry in fs::read_dir(&context.files_dir)? {
             let entry = entry?;
             let path = entry.path();
 
@@ -292,7 +442,7 @@ impl PeerClient {
                     .unwrap_or("unknown")
                     .to_string();
 
-                let file_id = format!("{}-{}", self.local_addr, file_name);
+                let file_id = format!("{}-{}", context.local_addr, file_name);
                 let file_info = FileInfo {
                     id: file_id.clone(),
                     name: file_name,
@@ -300,37 +450,126 @@ impl PeerClient {
                     path: path.to_string_lossy().to_string(),
                 };
 
-                self.files.insert(file_id, file_info);
+                context.files.insert(file_id, file_info);
             }
         }
 
-        info!("Scanned {} files from {}", self.files.len(), self.files_dir);
+        info!("Scanned {} files from {}", context.files.len(), context.files_dir);
         Ok(())
     }
 
-    async fn wait_for_connection(&mut self) -> Result<()> {
-        let start_time = Instant::now();
+    /// Generate file announcement messages for all scanned files
+    fn get_file_announcements(context: &HandlerContext) -> Vec<Communication> {
+        context.files
+            .values()
+            .map(|f| Communication::FileAnnounce {
+                file_id: f.id.clone(),
+                file_name: f.name.clone(),
+                file_size: f.size,
+            })
+            .collect()
+    }
+}
 
-        info!("Establishing QUIC connection...");
+struct MessageRouter {
+    handlers: Vec<Box<dyn MessageHandler>>,
+}
 
-        // Trigger initial handshake by processing events first
-        self.process_events()?;
+/// Configure a MessageRouter with all the standard handlers
+/// This function adds all the necessary handlers to the router in the correct order
+fn configure_router(router: &mut MessageRouter) {
+    // Add handlers in order of priority/specificity
+    router.add_handlers(PresenceHandler);
+    router.add_handlers(FileHandler);
+    router.add_handlers(PeerLifecycleHandler);
+}
 
-        while !self.conn.is_established() {
-            if start_time.elapsed() >= CONNECTION_TIMEOUT {
-                return Err(anyhow!("Connection timeout"));
-            }
+/// Message router that delegates incoming messages to appropriate handlers.
+/// The router tries each handler in sequence until one handles the message.
+/// 
+/// ## Router Pattern:
+/// - Handlers are processed in the order they were added
+/// - First handler that returns `Some(response)` wins
+/// - If no handler processes the message, an error response is sent
+/// 
+/// ## Adding New Handlers:
+/// Add new handlers by adding them as fields and calling their handle_peer_request method
+/// in the handle_message method. For a more extensible approach, consider using
+/// a Vec<Box<dyn MessageHandler>> pattern.
 
-            self.process_events()?;
-            tokio::time::sleep(Duration::from_millis(10)).await;
+impl MessageRouter {
+    fn new() -> Self {
+        Self {
+            handlers: Vec::new(),
         }
-
-        info!("QUIC connection established");
-        Ok(())
+    }
+    fn add_handlers<H: MessageHandler + 'static>(&mut self, handler: H) {
+        self.handlers.push(Box::new(handler));
     }
 
-    fn process_events(&mut self) -> Result<()> {
-        // Send outgoing packets first (important for initial handshake)
+
+    fn handle_peer_message(
+        &mut self,
+        message: &Communication,
+        context: &mut HandlerContext,
+    ) -> Result<Option<Communication>> {
+        for handler in &mut self.handlers {
+            if let Some(response) = handler.handle_peer_request(message, context)? {
+                return Ok(Some(response));
+            }
+        }
+        warn!("No handler found for message: {:?}", message);
+        Ok(Some(Communication::Error {
+            message: "Unhandled message type".to_string(),
+        }))
+    }
+
+    fn handle_server_side(
+        &mut self,
+        message: &Communication,
+        context: &mut HandlerContext,
+    ) -> Result<Option<Communication>> {
+        for handler in &mut self.handlers {
+            if let Some(response) = handler.handle_server_request(message, context)? {
+                return Ok(Some(response));
+            }
+        }
+        warn!("No handler found for server message: {:?}", message);
+        Ok(Some(Communication::Error {
+            message: "Unhandled server message type".to_string(),
+        }))
+    }
+}
+
+
+
+
+// Transport layer abstraction for QUIC communication
+struct QuicTransport {
+    conn: quiche::Connection,
+    socket: std::net::UdpSocket,
+    read_buf: [u8; 65535],
+    stream_responses: HashMap<u64, Vec<u8>>,
+    pending_requests: HashMap<u64, oneshot::Sender<Vec<u8>>>,
+    request_counter: Arc<AtomicU64>,
+}
+
+impl QuicTransport {
+    fn new(conn: quiche::Connection, socket: std::net::UdpSocket) -> Self {
+        Self {
+            conn,
+            socket,
+            read_buf: [0; 65535],
+            stream_responses: HashMap::new(),
+            pending_requests: HashMap::new(),
+            request_counter: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn process_events(&mut self) -> Result<Vec<(u64, Vec<u8>)>> {
+        let mut incoming_messages = Vec::new();
+
+        // Send outgoing packets first
         let mut write_buf = [0; MAX_DATAGRAM_SIZE];
         loop {
             let (write, send_info) = match self.conn.send(&mut write_buf) {
@@ -367,7 +606,7 @@ impl PeerClient {
             }
         }
 
-        // Read streams
+        // Read streams and collect complete messages
         for stream_id in self.conn.readable() {
             debug!("Stream {} is readable", stream_id);
             let mut temp_buf = [0; 65535];
@@ -385,104 +624,23 @@ impl PeerClient {
                         if let Some(sender) = self.pending_requests.remove(&stream_id) {
                             let _ = sender.send(response_data);
                         } else {
-                            // This is an incoming request from the server
-                            self.handle_incoming_request(stream_id, &response_data)?;
+                            // This is an incoming request
+                            incoming_messages.push((stream_id, response_data));
                         }
                     }
                 }
             }
         }
 
-        Ok(())
+        Ok(incoming_messages)
     }
 
-    fn handle_incoming_request(&mut self, stream_id: u64, data: &[u8]) -> Result<()> {
-        let communication = Communication::deserialize(data)?;
-        debug!("Received request: {:?}", communication);
-
-        let response = match communication {
-            Communication::FileRequest { file_id, peer_addr } => {
-                info!("Received file request for {} from {}", file_id, peer_addr);
-
-                if let Some(file_info) = self.files.get(&file_id).cloned() {
-                    // Start file transfer
-                    match self.send_file_response(stream_id, &file_info) {
-                        Ok(_) => return Ok(()), // File transfer handled separately
-                        Err(e) => {
-                            error!("Failed to send file: {}", e);
-                            Communication::Error {
-                                message: format!("Failed to send file: {}", e),
-                            }
-                        }
-                    }
-                } else {
-                    Communication::FileResponse {
-                        file_id,
-                        available: false,
-                        peer_addr: self.local_addr.clone(),
-                    }
-                }
-            }
-            Communication::FileList { peer_addr, .. } => {
-                info!("Received file list request from {}", peer_addr);
-                let files: Vec<(String, String, u64)> = self
-                    .files
-                    .values()
-                    .map(|f| (f.id.clone(), f.name.clone(), f.size))
-                    .collect();
-
-                Communication::FileList {
-                    peer_addr: self.local_addr.clone(),
-                    files,
-                }
-            }
-            _ => {
-                warn!("Unhandled incoming request: {:?}", communication);
-                Communication::Error {
-                    message: "Unhandled request type".to_string(),
-                }
-            }
-        };
-
-        self.send_response(stream_id, &response)?;
-        Ok(())
-    }
-
-    fn send_file_response(&mut self, stream_id: u64, file_info: &FileInfo) -> Result<()> {
-        info!("Starting file transfer for: {}", file_info.name);
-
-        let file_data = fs::read(&file_info.path)?;
-        let total_chunks = (file_data.len() + FILE_CHUNK_SIZE - 1) / FILE_CHUNK_SIZE;
-
-        for (chunk_index, chunk) in file_data.chunks(FILE_CHUNK_SIZE).enumerate() {
-            let is_last = chunk_index == total_chunks - 1;
-
-            let chunk_msg = Communication::FileChunk {
-                file_id: file_info.id.clone(),
-                chunk_index: chunk_index as u64,
-                chunk_data: chunk.to_vec(),
-                is_last,
-            };
-
-            self.send_response(stream_id, &chunk_msg)?;
-        }
-
-        info!("File transfer completed for: {}", file_info.name);
-        Ok(())
-    }
-
-    fn send_response(&mut self, stream_id: u64, communication: &Communication) -> Result<()> {
-        let data = communication.serialize()?;
-        self.conn.stream_send(stream_id, &data, true)?;
-        Ok(())
-    }
-
-    async fn send_request(&mut self, communication: &Communication) -> Result<Vec<u8>> {
-        self.process_events()?;
-        let stream_id = self.request_counter.fetch_add(4, Ordering::Relaxed);
+    async fn send_request(&mut self, message: &Communication) -> Result<Vec<u8>> {
+        // Generate client-initiated bidirectional stream ID
+        let stream_id = self.request_counter.fetch_add(4, Ordering::Relaxed) * 4;
         self.conn.stream_send(
             stream_id,
-            &communication.serialize()?,
+            &message.serialize()?,
             true,
         )?;
 
@@ -522,10 +680,175 @@ impl PeerClient {
         }
     }
 
+    fn send_response(&mut self, stream_id: u64, message: &Communication) -> Result<()> {
+        let data = message.serialize()?;
+        self.conn.stream_send(stream_id, &data, true)?;
+        Ok(())
+    }
+
+    fn is_established(&self) -> bool {
+        self.conn.is_established()
+    }
+}
+
+
+
+/// The main peer client using the handler-based architecture.
+/// 
+/// This struct delegates all message handling to the MessageRouter, which in turn
+/// uses specialized handlers for different types of communication.
+/// 
+/// ## Architecture:
+/// - `transport`: Handles QUIC communication
+/// - `router`: Routes messages to appropriate handlers  
+/// - `context`: Shared state accessible by all handlers
+struct PeerClient {
+    transport: QuicTransport,
+    router: MessageRouter,
+    context: HandlerContext,
+}
+
+impl PeerClient {
+    fn new(
+        server_addr: &str,
+        files_dir: String,
+        port: u16,
+        server_cert: Option<String>,
+        no_verify_tls: bool,
+    ) -> Result<Self> {
+        let server_url = if server_addr.starts_with("http") {
+            Url::parse(server_addr)?
+        } else {
+            Url::parse(&format!("https://{}", server_addr))?
+        };
+
+        let peer_addr = server_url
+            .socket_addrs(|| None)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("No valid address found"))?;
+
+        let bind_addr = match peer_addr {
+            SocketAddr::V4(_) => format!("0.0.0.0:{}", port),
+            SocketAddr::V6(_) => format!("[::]:{}", port),
+        };
+
+        let socket = std::net::UdpSocket::bind(bind_addr)?;
+        socket.set_nonblocking(true)?;
+
+        let mut quic_config = Self::create_quic_config(server_cert, no_verify_tls)?;
+        let mut scid = [0; quiche::MAX_CONN_ID_LEN];
+        SystemRandom::new().fill(&mut scid[..]).unwrap();
+
+        let local_addr = socket.local_addr()?;
+        let conn = quiche::connect(
+            server_url.domain(),
+            &quiche::ConnectionId::from_ref(&scid),
+            local_addr,
+            peer_addr,
+            &mut quic_config,
+        )?;
+
+        let local_addr_str = format!("{}", local_addr);
+        info!("Connection ID: {}", hex::encode(&scid));
+        
+        let transport = QuicTransport::new(conn, socket);
+        let mut router = MessageRouter::new();
+
+        // Configure router with all standard handlers
+        configure_router(&mut router);
+
+
+        let context = HandlerContext {
+            local_addr: local_addr_str,
+            files: HashMap::new(),
+            files_dir,
+        };
+
+        Ok(Self {
+            transport,
+            router,
+            context,
+        })
+    }
+
+    fn create_quic_config(
+        server_cert: Option<String>,
+        no_verify_tls: bool,
+    ) -> Result<quiche::Config> {
+        let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION)?;
+        let quic_config = QuicConfig::default();
+
+        config.set_application_protos(&[b"hq-interop", b"hq-29", b"hq-28", b"hq-27", b"http/0.9"])?;
+        config.set_max_idle_timeout(quic_config.max_idle_timeout_ms);
+        config.set_max_recv_udp_payload_size(quic_config.max_recv_udp_payload_size);
+        config.set_max_send_udp_payload_size(quic_config.max_send_udp_payload_size);
+        config.set_initial_max_data(quic_config.initial_max_data);
+        config.set_initial_max_stream_data_bidi_local(quic_config.initial_max_stream_data_bidi_local);
+        config.set_initial_max_stream_data_bidi_remote(quic_config.initial_max_stream_data_bidi_remote);
+        config.set_initial_max_streams_bidi(quic_config.initial_max_streams_bidi);
+        config.set_initial_max_streams_uni(quic_config.initial_max_streams_uni);
+        config.set_disable_active_migration(true);
+
+        if no_verify_tls {
+            config.verify_peer(false);
+            info!("TLS certificate verification disabled - this is insecure!");
+        } else {
+            if let Some(cert_path) = server_cert {
+                config.load_verify_locations_from_file(&cert_path)?;
+                info!("Using server certificate: {}", cert_path);
+            }
+            config.verify_peer(true);
+        }
+
+        Ok(config)
+    }
+
+   
+    async fn wait_for_connection(&mut self) -> Result<()> {
+        let start_time = Instant::now();
+        info!("Establishing QUIC connection...");
+
+        self.transport.process_events()?;
+
+        while !self.transport.is_established() {
+            if start_time.elapsed() >= CONNECTION_TIMEOUT {
+                return Err(anyhow!("Connection timeout"));
+            }
+
+            self.transport.process_events()?;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        info!("QUIC connection established");
+        Ok(())
+    }
+
+    fn process_events(&mut self) -> Result<()> {
+        let incoming_messages = self.transport.process_events()?;
+        
+        // Handle incoming messages using the router
+        for (stream_id, data) in incoming_messages {
+            if let Ok(message) = Communication::deserialize(&data) {
+                debug!("Received incoming message: {:?}", message);
+                
+                if let Some(response) = self.router.handle_peer_message(&message, &mut self.context)? {
+                    self.transport.send_response(stream_id, &response)?;
+                }
+            }
+        }
+        
+        Ok(())
+    }
+
+    async fn send_request(&mut self, communication: &Communication) -> Result<Vec<u8>> {
+        self.transport.send_request(communication).await
+    }
+
     async fn announce_presence(&mut self) -> Result<()> {
         info!("Announcing presence to server...");
         let msg = Communication::PresenceAnnounce {
-            peer_addr: self.local_addr.clone(),
+            peer_addr: self.context.local_addr.clone(),
         };
 
         self.send_request(&msg).await?;
@@ -533,33 +856,9 @@ impl PeerClient {
         Ok(())
     }
 
-    async fn announce_files(&mut self) -> Result<()> {
-        info!("Announcing files to server...");
-
-        let file_list: Vec<(String, String, u64)> = self
-            .files
-            .values()
-            .map(|f| (f.id.clone(), f.name.clone(), f.size))
-            .collect();
-
-        for (file_id, file_name, file_size) in file_list {
-            let msg = Communication::FileAnnounce {
-                file_id,
-                file_name,
-                file_size,
-            };            
-            self.send_request(&msg).await?;
-        }
-
-        info!("All files announced successfully");
-        Ok(())
-    }
-
     async fn run(&mut self) -> Result<()> {
-        self.scan_files()?;
         self.wait_for_connection().await?;
         self.announce_presence().await?;
-        self.announce_files().await?;
 
         info!("Peer is running and listening for requests...");
 
@@ -570,6 +869,16 @@ impl PeerClient {
     }
 }
 
+
+#[derive(Debug, Clone, bincode::Encode, bincode::Decode)]
+struct FileInfo {
+    id: String,
+    name: String,
+    size: u64,
+    path: String,
+}
+
+
 struct Client {
     conn: quiche::Connection,
     partial_responses: HashMap<u64, Vec<u8>>,
@@ -577,15 +886,18 @@ struct Client {
 
 type ClientMap = HashMap<Vec<u8>, Client>;
 
+/// Server using the same handler-based architecture as the peer client.
+/// This ensures consistent message processing across both client and server.
 struct Server {
     socket: std::net::UdpSocket,
     clients: ClientMap,
     read_buf: [u8; 65535],
     out_buf: [u8; 1350],
     config: quiche::Config,
-    peers: HashMap<String, Vec<(String, String, u64)>>, // peer_addr -> files
-    files_dir: String,
     conn_id_seed: ring::hmac::Key,
+    // Handler architecture components
+    router: MessageRouter,
+    context: HandlerContext,
 }
 
 impl Server {
@@ -626,15 +938,25 @@ impl Server {
         let conn_id_seed = ring::hmac::Key::generate(ring::hmac::HMAC_SHA256, &rng)
             .map_err(|_| anyhow!("Failed to generate connection ID seed"))?;
 
+        let mut router = MessageRouter::new();
+
+        // Configure router with all standard handlers
+        configure_router(&mut router);
+        let context = HandlerContext {
+            local_addr: addr.to_string(),
+            files: HashMap::new(),
+            files_dir: files_dir.clone(),
+        };
+
         Ok(Self {
             socket,
             clients: HashMap::new(),
             read_buf: [0; 65535],
             out_buf: [0; 1350],
             config,
-            peers: HashMap::new(),
-            files_dir,
             conn_id_seed,
+            router,
+            context,
         })
     }
 
@@ -814,39 +1136,17 @@ impl Server {
                             if let Ok(communication) = Communication::deserialize(&response_data) {
                                 debug!("Received from peer: {:?}", communication);
                                 
-                                match communication {
-                                    Communication::PresenceAnnounce { peer_addr } => {
-                                        info!("Peer {} announced presence", peer_addr);
-                                        
-                                        let response = Communication::PresenceResponse { peer_addr };
-                                        if let Ok(data) = response.serialize() {
-                                            debug!("Sending presence response on stream {}", stream_id);
-                                            // Send response on the same stream and close it
-                                            match client.conn.stream_send(stream_id, &data, true) {
-                                                Ok(_) => debug!("Successfully sent presence response"),
-                                                Err(e) => warn!("Failed to send presence response: {:?}", e),
-                                            }
+                                // Use the handler-based architecture for consistent message processing
+                                if let Ok(Some(response)) = self.router.handle_server_side(&communication, &mut self.context) {
+                                    if let Ok(data) = response.serialize() {
+                                        debug!("Sending response on stream {}", stream_id);
+                                        match client.conn.stream_send(stream_id, &data, true) {
+                                            Ok(_) => debug!("Successfully sent response"),
+                                            Err(e) => warn!("Failed to send response: {:?}", e),
                                         }
                                     }
-                                    Communication::FileAnnounce { file_id, file_name, file_size } => {
-                                        info!("File announced: {} ({} bytes)", file_name, file_size);
-                                        
-                                        let response = Communication::FileAcknowledge {
-                                            file_id,
-                                            peer_addr: "server".to_string(),
-                                        };
-                                        if let Ok(data) = response.serialize() {
-                                            debug!("Sending file acknowledge on stream {}", stream_id);
-                                            // Send response on the same stream and close it
-                                            match client.conn.stream_send(stream_id, &data, true) {
-                                                Ok(_) => debug!("Successfully sent file acknowledge"),
-                                                Err(e) => warn!("Failed to send file acknowledge: {:?}", e),
-                                            }
-                                        }
-                                    }
-                                    _ => {
-                                        warn!("Unhandled message type: {:?}", communication);
-                                    }
+                                } else {
+                                    warn!("No response generated for message: {:?}", communication);
                                 }
                             }
                         }
@@ -893,83 +1193,6 @@ impl Server {
         }
     }
 
-    fn process_connection(&mut self, conn: &mut quiche::Connection) -> Result<()> {
-        for stream_id in conn.readable() {
-            let mut response_data = Vec::new();
-            let mut temp_buf = [0; 65535];
-
-            loop {
-                match conn.stream_recv(stream_id, &mut temp_buf) {
-                    Ok((read, fin)) => {
-                        response_data.extend_from_slice(&temp_buf[..read]);
-                        if fin {
-                            break;
-                        }
-                    }
-                    Err(quiche::Error::Done) => break,
-                    Err(e) => {
-                        warn!("Stream recv error: {:?}", e);
-                        break;
-                    }
-                }
-            }
-
-            if !response_data.is_empty() {
-                self.handle_peer_message(conn, stream_id, &response_data)?;
-            }
-        }
-
-        Ok(())
-    }
-
-    fn handle_peer_message(
-        &mut self,
-        conn: &mut quiche::Connection,
-        stream_id: u64,
-        data: &[u8],
-    ) -> Result<()> {
-        let communication = Communication::deserialize(data)?;
-        debug!("Received from peer: {:?}", communication);
-
-        match communication {
-            Communication::PresenceAnnounce { peer_addr } => {
-                info!("Peer {} announced presence", peer_addr);
-                self.peers.entry(peer_addr.clone()).or_insert_with(Vec::new);
-
-                let response = Communication::PresenceResponse { peer_addr };
-                self.send_response(conn, stream_id, &response)?;
-            }
-            Communication::FileAnnounce {
-                file_id,
-                file_name,
-                file_size,
-            } => {
-                info!("File announced: {} ({} bytes)", file_name, file_size);
-
-                let response = Communication::FileAcknowledge {
-                    file_id,
-                    peer_addr: "server".to_string(),
-                };
-                self.send_response(conn, stream_id, &response)?;
-            }
-            _ => {
-                warn!("Unhandled message type: {:?}", communication);
-            }
-        }
-
-        Ok(())
-    }
-
-    fn send_response(
-        &self,
-        conn: &mut quiche::Connection,
-        stream_id: u64,
-        communication: &Communication,
-    ) -> Result<()> {
-        let data = communication.serialize()?;
-        conn.stream_send(stream_id, &data, true)?;
-        Ok(())
-    }
 }
 
 async fn start_peer(
@@ -992,6 +1215,8 @@ fn start_server(
     let mut server = Server::new(&addr, &cert_path, &key_path, files_dir)?;
     server.run()
 }
+
+
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -1078,3 +1303,4 @@ fn validate_token(src: &SocketAddr, token: &[u8]) -> Option<Vec<u8>> {
     // Return the original DCID
     Some(dcid.to_vec())
 }
+
