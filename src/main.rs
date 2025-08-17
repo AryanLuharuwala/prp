@@ -12,8 +12,8 @@ use clap::{Parser, Subcommand};
 use log::{debug, error, info, warn, trace};
 use ring::rand::{SystemRandom,SecureRandom};
 use serde::{Deserialize, Serialize};
+use tokio::stream;
 use tokio::sync::oneshot;
-use tokio::time::timeout;
 use url::Url;
 
 /// P2P File Transfer CLI
@@ -369,10 +369,11 @@ impl PeerClient {
 
         // Read streams
         for stream_id in self.conn.readable() {
+            debug!("Stream {} is readable", stream_id);
             let mut temp_buf = [0; 65535];
             while let Ok((read, fin)) = self.conn.stream_recv(stream_id, &mut temp_buf) {
                 let data = &temp_buf[..read];
-
+                debug!("Received {} bytes on stream {}", read, stream_id);
                 self.stream_responses
                     .entry(stream_id)
                     .or_insert_with(Vec::new)
@@ -477,21 +478,47 @@ impl PeerClient {
     }
 
     async fn send_request(&mut self, communication: &Communication) -> Result<Vec<u8>> {
-        let stream_id = self.conn.stream_send(
-            self.request_counter.fetch_add(1, Ordering::Relaxed),
+        self.process_events()?;
+        let stream_id = self.request_counter.fetch_add(4, Ordering::Relaxed);
+        self.conn.stream_send(
+            stream_id,
             &communication.serialize()?,
             true,
-        )? as u64;
+        )?;
 
-        let (tx, rx) = oneshot::channel();
+        let (tx, mut rx) = oneshot::channel();
         self.pending_requests.insert(stream_id, tx);
 
+        // Process events initially to send the request
         self.process_events()?;
 
-        match timeout(REQUEST_TIMEOUT, rx).await {
-            Ok(Ok(response)) => Ok(response),
-            Ok(Err(_)) => Err(anyhow!("Request channel closed")),
-            Err(_) => Err(anyhow!("Request timeout")),
+        // Keep processing events while waiting for response
+        let start_time = Instant::now();
+        loop {
+            // Process any incoming events
+            self.process_events()?;
+            
+            // Check if we have a response (non-blocking check)
+            match rx.try_recv() {
+                Ok(response) => {
+                    debug!("Received response: {} bytes", response.len());
+                    return Ok(response);
+                }
+                Err(oneshot::error::TryRecvError::Empty) => {
+                    // No response yet, continue waiting
+                }
+                Err(oneshot::error::TryRecvError::Closed) => {
+                    return Err(anyhow!("Request channel closed"));
+                }
+            }
+            
+            // Check for timeout
+            if start_time.elapsed() >= REQUEST_TIMEOUT {
+                return Err(anyhow!("Request timeout"));
+            }
+            
+            // Small delay to avoid busy waiting
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
 
@@ -520,8 +547,7 @@ impl PeerClient {
                 file_id,
                 file_name,
                 file_size,
-            };
-
+            };            
             self.send_request(&msg).await?;
         }
 
@@ -791,12 +817,15 @@ impl Server {
                                 match communication {
                                     Communication::PresenceAnnounce { peer_addr } => {
                                         info!("Peer {} announced presence", peer_addr);
-                                        // Note: We can't modify self.peers here due to borrow checker
-                                        // This would need to be handled after the loop
                                         
                                         let response = Communication::PresenceResponse { peer_addr };
                                         if let Ok(data) = response.serialize() {
-                                            let _ = client.conn.stream_send(stream_id, &data, true);
+                                            debug!("Sending presence response on stream {}", stream_id);
+                                            // Send response on the same stream and close it
+                                            match client.conn.stream_send(stream_id, &data, true) {
+                                                Ok(_) => debug!("Successfully sent presence response"),
+                                                Err(e) => warn!("Failed to send presence response: {:?}", e),
+                                            }
                                         }
                                     }
                                     Communication::FileAnnounce { file_id, file_name, file_size } => {
@@ -807,7 +836,12 @@ impl Server {
                                             peer_addr: "server".to_string(),
                                         };
                                         if let Ok(data) = response.serialize() {
-                                            let _ = client.conn.stream_send(stream_id, &data, true);
+                                            debug!("Sending file acknowledge on stream {}", stream_id);
+                                            // Send response on the same stream and close it
+                                            match client.conn.stream_send(stream_id, &data, true) {
+                                                Ok(_) => debug!("Successfully sent file acknowledge"),
+                                                Err(e) => warn!("Failed to send file acknowledge: {:?}", e),
+                                            }
                                         }
                                     }
                                     _ => {
