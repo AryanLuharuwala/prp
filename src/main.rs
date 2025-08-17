@@ -14,6 +14,7 @@ use ring::rand::{SystemRandom,SecureRandom};
 use serde::{Deserialize, Serialize};
 
 use tokio::sync::oneshot;
+use tokio::io::{self as tokio_io, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use url::Url;
 
 /// P2P File Transfer CLI
@@ -267,10 +268,10 @@ trait MessageHandler {
 
 /// Context passed to handlers containing transport and session information.
 /// This provides handlers with access to peer state and configuration.
-struct HandlerContext {
-    local_addr: String,
-    files: HashMap<String, FileInfo>,
-    files_dir: String,
+pub struct HandlerContext {
+    pub local_addr: String,
+    pub files: HashMap<String, FileInfo>,
+    pub files_dir: String,
 }
 
 
@@ -418,7 +419,7 @@ impl MessageHandler for PeerLifecycleHandler {
 
 impl PeerLifecycleHandler {
     /// Scan files in the peer's directory and update the context
-    fn scan_files(context: &mut HandlerContext) -> Result<()> {
+    pub fn scan_files(context: &mut HandlerContext) -> Result<()> {
         context.files.clear();
 
         if context.files_dir.is_empty() {
@@ -471,7 +472,7 @@ impl PeerLifecycleHandler {
     }
 }
 
-struct MessageRouter {
+pub struct MessageRouter {
     handlers: Vec<Box<dyn MessageHandler>>,
 }
 
@@ -545,7 +546,7 @@ impl MessageRouter {
 
 
 // Transport layer abstraction for QUIC communication
-struct QuicTransport {
+pub struct QuicTransport {
     conn: quiche::Connection,
     socket: std::net::UdpSocket,
     read_buf: [u8; 65535],
@@ -567,6 +568,18 @@ impl QuicTransport {
     }
 
     fn process_events(&mut self) -> Result<Vec<(u64, Vec<u8>)>> {
+        // Handle ip changes
+        if !self.is_established() && self.conn.local_error().is_some() {
+            let bind_addr = std::net::SocketAddr::new(
+                self.socket.local_addr()?.ip(),
+                self.socket.local_addr()?.port(),
+            );
+            debug!("Rebinding socket to {}", bind_addr);
+            self.socket = std::net::UdpSocket::bind(bind_addr)?;
+            self.conn.migrate_source(bind_addr)?;
+            debug!("Socket rebound to {}", bind_addr);
+        }
+
         let mut incoming_messages = Vec::new();
 
         // Send outgoing packets first
@@ -702,10 +715,10 @@ impl QuicTransport {
 /// - `transport`: Handles QUIC communication
 /// - `router`: Routes messages to appropriate handlers  
 /// - `context`: Shared state accessible by all handlers
-struct PeerClient {
-    transport: QuicTransport,
-    router: MessageRouter,
-    context: HandlerContext,
+pub struct PeerClient {
+    pub transport: QuicTransport,
+    pub router: MessageRouter,
+    pub context: HandlerContext,
 }
 
 impl PeerClient {
@@ -841,37 +854,11 @@ impl PeerClient {
         Ok(())
     }
 
-    async fn send_request(&mut self, communication: &Communication) -> Result<Vec<u8>> {
-        self.transport.send_request(communication).await
     }
-
-    async fn announce_presence(&mut self) -> Result<()> {
-        info!("Announcing presence to server...");
-        let msg = Communication::PresenceAnnounce {
-            peer_addr: self.context.local_addr.clone(),
-        };
-
-        self.send_request(&msg).await?;
-        info!("Presence announced successfully");
-        Ok(())
-    }
-
-    async fn run(&mut self) -> Result<()> {
-        self.wait_for_connection().await?;
-        self.announce_presence().await?;
-
-        info!("Peer is running and listening for requests...");
-
-        loop {
-            self.process_events()?;
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    }
-}
 
 
 #[derive(Debug, Clone, bincode::Encode, bincode::Decode)]
-struct FileInfo {
+pub struct FileInfo {
     id: String,
     name: String,
     size: u64,
@@ -1202,8 +1189,16 @@ async fn start_peer(
     server_cert: Option<String>,
     no_verify_tls: bool,
 ) -> Result<()> {
-    let mut peer = PeerClient::new(&server_addr, files_dir, port, server_cert, no_verify_tls)?;
-    peer.run().await
+    let peer = PeerClient::new(&server_addr, files_dir, port, server_cert, no_verify_tls)?;
+    
+    // Wait for connection to be established
+    let mut peer_client = peer;
+    peer_client.wait_for_connection().await?;
+    peer_client.announce_presence().await?;
+    
+    // Start the interactive user interface
+    let mut ui = UserInterface::new(peer_client, QuicTransport::new(peer.transport.conn, peer.transport.socket));
+    ui.run().await
 }
 
 fn start_server(
@@ -1302,5 +1297,280 @@ fn validate_token(src: &SocketAddr, token: &[u8]) -> Option<Vec<u8>> {
 
     // Return the original DCID
     Some(dcid.to_vec())
+}
+
+/// User interface for interactive peer operations
+/// Provides commands for users to interact with the P2P network
+struct UserInterface {
+    peer_client: PeerClient,
+    transport: QuicTransport,
+}
+
+impl UserInterface {
+    fn new(peer_client: PeerClient, transport: QuicTransport) -> Self {
+        Self { peer_client, transport }
+    }
+
+    /// Start the interactive user interface
+    async fn run(&mut self) -> Result<()> {
+        println!("=== P2P File Transfer Client ===");
+        println!("Available commands:");
+        println!("  help                    - Show this help message");
+        println!("  announce                - Announce presence to server");
+        println!("  scan                    - Scan local files");
+        println!("  list                    - List local files");
+        println!("  request <file_id>       - Request file availability from network");
+        println!("  get <file_id>           - Download a file from a peer");
+        println!("  status                  - Show connection status");
+        println!("  quit                    - Exit the application");
+        println!();
+
+        let stdin = tokio_io::stdin();
+        let reader = BufReader::new(stdin);
+        let mut lines = reader.lines();
+
+        // Print initial prompt
+        print!("p2p> ");
+        let _ = tokio_io::stdout().flush().await;
+
+        loop {
+            // Process events to handle incoming messages
+            if let Err(e) = self.peer_client.process_events() {
+                warn!("Error processing events: {}", e);
+            }
+
+            // Check for user input with timeout
+            tokio::select! {
+                line_result = lines.next_line() => {
+                    match line_result {
+                        Ok(Some(line)) => {
+                            let trimmed = line.trim();
+                            if trimmed.is_empty() {
+                                // Print prompt again for empty input
+                                print!("p2p> ");
+                                let _ = tokio_io::stdout().flush().await;
+                                continue;
+                            }
+
+                            if let Err(e) = self.handle_command(trimmed).await {
+                                println!("Error: {}", e);
+                            }
+
+                            if trimmed == "quit" {
+                                break;
+                            }
+
+                            // Print prompt again after handling command
+                            print!("p2p> ");
+                            let _ = tokio_io::stdout().flush().await;
+                        }
+                        Ok(None) => {
+                            // EOF reached
+                            break;
+                        }
+                        Err(e) => {
+                            error!("Error reading input: {}", e);
+                            break;
+                        }
+                    }
+                }
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                    // Timeout - just continue to process events, don't print prompt
+                    continue;
+                }
+            }
+        }
+
+        println!("Goodbye!");
+        Ok(())
+    }
+
+    /// Handle user commands
+    async fn handle_command(&mut self, command: &str) -> Result<()> {
+        let parts: Vec<&str> = command.split_whitespace().collect();
+        let cmd = parts.first().unwrap_or(&"");
+
+        match *cmd {
+            "help" => {
+                println!("Available commands:");
+                println!("  help                    - Show this help message");
+                println!("  announce                - Announce presence to server");
+                println!("  scan                    - Scan local files");
+                println!("  list                    - List local files");
+                println!("  request <file_id>       - Request file availability from network");
+                println!("  get <file_id>           - Download a file from a peer");
+                println!("  status                  - Show connection status");
+                println!("  quit                    - Exit the application");
+            }
+            "announce" => {
+                self.announce_presence().await?;
+            }
+            "scan" => {
+                self.scan_files().await?;
+            }
+            "list" => {
+                self.list_files().await?;
+            }
+            "request" => {
+                if let Some(file_id) = parts.get(1) {
+                    self.request_file(file_id).await?;
+                } else {
+                    println!("Usage: request <file_id>");
+                }
+            }
+            "get" => {
+                if let Some(file_id) = parts.get(1) {
+                    self.get_file(file_id).await?;
+                } else {
+                    println!("Usage: get <file_id>");
+                }
+            }
+            "status" => {
+                self.show_status().await?;
+            }
+            "quit" => {
+                // Handle quit in the main loop
+            }
+            _ => {
+                println!("Unknown command: {}. Type 'help' for available commands.", cmd);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Announce presence to the server
+    async fn announce_presence(&mut self) -> Result<()> {
+        println!("Announcing presence to server...");
+        self.transport.send_request(&Communication::PresenceAnnounce { peer_addr: self.peer_client.context.local_addr.clone() }).await?;
+        println!("Presence announced successfully!");
+        Ok(())
+    }
+
+    /// Scan local files
+    async fn scan_files(&mut self) -> Result<()> {
+        println!("Scanning local files...");
+        PeerLifecycleHandler::scan_files(&mut self.peer_client.context)?;
+        println!("Found {} files in local directory", self.peer_client.context.files.len());
+        Ok(())
+    }
+
+    /// List local files
+    async fn list_files(&mut self) -> Result<()> {
+        if self.peer_client.context.files.is_empty() {
+            println!("No files found. Run 'scan' to scan local directory.");
+            return Ok(());
+        }
+
+        println!("Local files:");
+        for (file_id, file_info) in &self.peer_client.context.files {
+            println!("  {} - {} ({} bytes)", file_id, file_info.name, file_info.size);
+        }
+        Ok(())
+    }
+
+    /// Request file availability from the network
+    async fn request_file(&mut self, file_id: &str) -> Result<()> {
+        println!("Requesting file availability for: {}", file_id);
+        
+        let request = Communication::FileRequest {
+            file_id: file_id.to_string(),
+            peer_addr: self.peer_client.context.local_addr.clone(),
+        };
+
+        match self.transport.send_request(&request).await {
+            Ok(response_data) => {
+                if let Ok(response) = Communication::deserialize(&response_data) {
+                    match response {
+                        Communication::FileResponse { file_id, available, peer_addr } => {
+                            if available {
+                                println!("File '{}' is available from peer: {}", file_id, peer_addr);
+                            } else {
+                                println!("File '{}' is not available from peer: {}", file_id, peer_addr);
+                            }
+                        }
+                        Communication::Error { message } => {
+                            println!("Error response: {}", message);
+                        }
+                        _ => {
+                            println!("Unexpected response type");
+                        }
+                    }
+                } else {
+                    println!("Failed to parse response");
+                }
+            }
+            Err(e) => {
+                println!("Failed to send request: {}", e);
+            }
+        }
+        Ok(())
+    }
+
+    /// Download a file from a peer
+    async fn get_file(&mut self, file_id: &str) -> Result<()> {
+        println!("Downloading file: {}", file_id);
+        
+        let request = Communication::FileGet {
+            file_id: file_id.to_string(),
+            peer_addr: self.peer_client.context.local_addr.clone(),
+        };
+
+        match self.transport.send_request(&request).await {
+            Ok(response_data) => {
+                if let Ok(response) = Communication::deserialize(&response_data) {
+                    match response {
+                        Communication::FileGetResponse { file_id, success, file_data, error_message, peer_addr } => {
+                            if success {
+                                if let Some(data) = file_data {
+                                    // Save the file to local directory
+                                    let file_name = file_id.split('-').last().unwrap_or(&file_id);
+                                    let file_path = format!("{}/{}", self.peer_client.context.files_dir, file_name);
+                                    let data_len = data.len();
+                                    
+                                    match fs::write(&file_path, data) {
+                                        Ok(_) => {
+                                            println!("File '{}' downloaded successfully and saved to: {}", file_id, file_path);
+                                            println!("Downloaded {} bytes from peer: {}", data_len, peer_addr);
+                                        }
+                                        Err(e) => {
+                                            println!("Failed to save file: {}", e);
+                                        }
+                                    }
+                                } else {
+                                    println!("File data is empty");
+                                }
+                            } else {
+                                let error = error_message.unwrap_or_else(|| "Unknown error".to_string());
+                                println!("Failed to download file '{}': {}", file_id, error);
+                            }
+                        }
+                        Communication::Error { message } => {
+                            println!("Error response: {}", message);
+                        }
+                        _ => {
+                            println!("Unexpected response type");
+                        }
+                    }
+                } else {
+                    println!("Failed to parse response");
+                }
+            }
+            Err(e) => {
+                println!("Failed to send download request: {}", e);
+            }
+        }
+        Ok(())
+    }
+
+    /// Show connection status
+    async fn show_status(&mut self) -> Result<()> {
+        let is_connected = self.peer_client.transport.is_established();
+        println!("Connection status: {}", if is_connected { "Connected" } else { "Disconnected" });
+        println!("Local address: {}", self.peer_client.context.local_addr);
+        println!("Files directory: {}", self.peer_client.context.files_dir);
+        println!("Local files count: {}", self.peer_client.context.files.len());
+        Ok(())
+    }
 }
 
