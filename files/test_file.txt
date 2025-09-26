@@ -1,0 +1,2 @@
+Hello from peer! This is a test file for P2P transfer.
+It contains some sample data to demonstrate the file transfer functionality.

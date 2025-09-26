@@ -272,6 +272,8 @@ pub struct HandlerContext {
     pub local_addr: String,
     pub files: HashMap<String, FileInfo>,
     pub files_dir: String,
+    // Global registry of files from all connected peers (server-side only)
+    pub peer_files: HashMap<String, Vec<(String, String, u64)>>, // peer_addr -> [(file_id, file_name, file_size)]
 }
 
 
@@ -381,8 +383,52 @@ impl MessageHandler for FileHandler {
         }
     }
     fn handle_server_request(&mut self, message: &Communication, context: &mut HandlerContext) -> Result<Option<Communication>> {
-        // For server-side file handling, we can reuse the same logic as client-side
-        self.handle_peer_request(message, context)
+        match message {
+            Communication::FileAnnounce { file_id, file_name, file_size } => {
+                info!("Server received file announcement: {} ({} bytes)", file_name, file_size);
+                
+                // Extract peer address from file_id (format: "peer_addr-filename")
+                let peer_addr = if let Some(dash_pos) = file_id.find('-') {
+                    file_id[..dash_pos].to_string()
+                } else {
+                    // Fallback if file_id format is different
+                    context.local_addr.clone()
+                };
+                
+                // Store file in global peer registry
+                context.peer_files
+                    .entry(peer_addr.clone())
+                    .or_insert_with(Vec::new)
+                    .push((file_id.clone(), file_name.clone(), *file_size));
+                
+                info!("File stored in server registry for peer {}", peer_addr);
+                
+                Ok(Some(Communication::FileAcknowledge {
+                    file_id: file_id.clone(),
+                    peer_addr: context.local_addr.clone(),
+                }))
+            }
+            Communication::FileList { peer_addr, .. } => {
+                info!("Server received file list request from {}", peer_addr);
+                
+                // Collect files from all OTHER peers (not the requesting peer)
+                let mut all_files = Vec::new();
+                for (other_peer, files) in &context.peer_files {
+                    if other_peer != peer_addr {
+                        all_files.extend(files.clone());
+                    }
+                }
+                
+                info!("Returning {} files from {} other peers", all_files.len(), context.peer_files.len());
+                
+                Ok(Some(Communication::FileList {
+                    peer_addr: context.local_addr.clone(),
+                    files: all_files,
+                }))
+            }
+            // For other requests, use the peer-side logic
+            _ => self.handle_peer_request(message, context),
+        }
     }
 }
 
@@ -568,18 +614,6 @@ impl QuicTransport {
     }
 
     fn process_events(&mut self) -> Result<Vec<(u64, Vec<u8>)>> {
-        // Handle ip changes
-        if !self.is_established() && self.conn.local_error().is_some() {
-            let bind_addr = std::net::SocketAddr::new(
-                self.socket.local_addr()?.ip(),
-                self.socket.local_addr()?.port(),
-            );
-            debug!("Rebinding socket to {}", bind_addr);
-            self.socket = std::net::UdpSocket::bind(bind_addr)?;
-            self.conn.migrate_source(bind_addr)?;
-            debug!("Socket rebound to {}", bind_addr);
-        }
-
         let mut incoming_messages = Vec::new();
 
         // Send outgoing packets first
@@ -776,6 +810,7 @@ impl PeerClient {
             local_addr: local_addr_str,
             files: HashMap::new(),
             files_dir,
+            peer_files: HashMap::new(),
         };
 
         Ok(Self {
@@ -854,7 +889,33 @@ impl PeerClient {
         Ok(())
     }
 
+    async fn send_request(&mut self, communication: &Communication) -> Result<Vec<u8>> {
+        self.transport.send_request(communication).await
     }
+
+    async fn announce_presence(&mut self) -> Result<()> {
+        info!("Announcing presence to server...");
+        let msg = Communication::PresenceAnnounce {
+            peer_addr: self.context.local_addr.clone(),
+        };
+
+        self.send_request(&msg).await?;
+        info!("Presence announced successfully");
+        Ok(())
+    }
+
+    async fn run(&mut self) -> Result<()> {
+        self.wait_for_connection().await?;
+        self.announce_presence().await?;
+
+        info!("Peer is running and listening for requests...");
+
+        loop {
+            self.process_events()?;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+}
 
 
 #[derive(Debug, Clone, bincode::Encode, bincode::Decode)]
@@ -933,6 +994,7 @@ impl Server {
             local_addr: addr.to_string(),
             files: HashMap::new(),
             files_dir: files_dir.clone(),
+            peer_files: HashMap::new(),
         };
 
         Ok(Self {
@@ -1197,7 +1259,7 @@ async fn start_peer(
     peer_client.announce_presence().await?;
     
     // Start the interactive user interface
-    let mut ui = UserInterface::new(peer_client, QuicTransport::new(peer.transport.conn, peer.transport.socket));
+    let mut ui = UserInterface::new(peer_client);
     ui.run().await
 }
 
@@ -1303,12 +1365,11 @@ fn validate_token(src: &SocketAddr, token: &[u8]) -> Option<Vec<u8>> {
 /// Provides commands for users to interact with the P2P network
 struct UserInterface {
     peer_client: PeerClient,
-    transport: QuicTransport,
 }
 
 impl UserInterface {
-    fn new(peer_client: PeerClient, transport: QuicTransport) -> Self {
-        Self { peer_client, transport }
+    fn new(peer_client: PeerClient) -> Self {
+        Self { peer_client }
     }
 
     /// Start the interactive user interface
@@ -1397,6 +1458,7 @@ impl UserInterface {
                 println!("  announce                - Announce presence to server");
                 println!("  scan                    - Scan local files");
                 println!("  list                    - List local files");
+                println!("  discover                - Discover files available from other peers");
                 println!("  request <file_id>       - Request file availability from network");
                 println!("  get <file_id>           - Download a file from a peer");
                 println!("  status                  - Show connection status");
@@ -1410,6 +1472,9 @@ impl UserInterface {
             }
             "list" => {
                 self.list_files().await?;
+            }
+            "discover" => {
+                self.discover_network_files().await?;
             }
             "request" => {
                 if let Some(file_id) = parts.get(1) {
@@ -1442,7 +1507,7 @@ impl UserInterface {
     /// Announce presence to the server
     async fn announce_presence(&mut self) -> Result<()> {
         println!("Announcing presence to server...");
-        self.transport.send_request(&Communication::PresenceAnnounce { peer_addr: self.peer_client.context.local_addr.clone() }).await?;
+        self.peer_client.announce_presence().await?;
         println!("Presence announced successfully!");
         Ok(())
     }
@@ -1465,6 +1530,46 @@ impl UserInterface {
         println!("Local files:");
         for (file_id, file_info) in &self.peer_client.context.files {
             println!("  {} - {} ({} bytes)", file_id, file_info.name, file_info.size);
+            debug!("File stored with ID: '{}', Path: '{}'", file_id, file_info.path);
+        }
+        Ok(())
+    }
+
+    /// Discover files available from other peers in the network
+    async fn discover_network_files(&mut self) -> Result<()> {
+        println!("Discovering files from other peers in the network...");
+        
+        // Send a FileList request to the server to get files from other peers
+        let request = Communication::FileList {
+            peer_addr: self.peer_client.context.local_addr.clone(),
+            files: vec![], // Empty - this is a request, not a response
+        };
+
+        match self.peer_client.send_request(&request).await {
+            Ok(response_data) => {
+                if let Ok(response) = Communication::deserialize(&response_data) {
+                    match response {
+                        Communication::FileList { peer_addr, files } => {
+                            if files.is_empty() {
+                                println!("No files found from other peers.");
+                            } else {
+                                println!("Files available from other peers:");
+                                for (file_id, file_name, file_size) in files {
+                                    println!("  {} - {} ({} bytes) [from {}]", file_id, file_name, file_size, peer_addr);
+                                }
+                            }
+                        }
+                        _ => {
+                            println!("Unexpected response format");
+                        }
+                    }
+                } else {
+                    println!("Failed to parse server response");
+                }
+            }
+            Err(e) => {
+                println!("Failed to discover network files: {}", e);
+            }
         }
         Ok(())
     }
@@ -1478,7 +1583,7 @@ impl UserInterface {
             peer_addr: self.peer_client.context.local_addr.clone(),
         };
 
-        match self.transport.send_request(&request).await {
+        match self.peer_client.send_request(&request).await {
             Ok(response_data) => {
                 if let Ok(response) = Communication::deserialize(&response_data) {
                     match response {
@@ -1510,13 +1615,42 @@ impl UserInterface {
     /// Download a file from a peer
     async fn get_file(&mut self, file_id: &str) -> Result<()> {
         println!("Downloading file: {}", file_id);
+        debug!("Looking for file with ID: '{}'", file_id);
+        debug!("Available files: {:?}", self.peer_client.context.files.keys().collect::<Vec<_>>());
         
+        // Check if this is a local file first (self-download)
+        if let Some(file_info) = self.peer_client.context.files.get(file_id) {
+            println!("File '{}' found locally, copying to current directory...", file_id);
+            match fs::read(&file_info.path) {
+                Ok(data) => {
+                    let file_name = file_id.split('-').last().unwrap_or(&file_id);
+                    let file_path = format!("{}/{}", self.peer_client.context.files_dir, file_name);
+                    match fs::write(&file_path, &data) {
+                        Ok(_) => {
+                            println!("File '{}' copied successfully to: {}", file_id, file_path);
+                            println!("Copied {} bytes", data.len());
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            println!("Failed to copy file: {}", e);
+                            return Err(anyhow!("Failed to copy file: {}", e));
+                        }
+                    }
+                }
+                Err(e) => {
+                    println!("Failed to read local file: {}", e);
+                    return Err(anyhow!("Failed to read local file: {}", e));
+                }
+            }
+        }
+        
+        // If not local, try to download from network
         let request = Communication::FileGet {
             file_id: file_id.to_string(),
             peer_addr: self.peer_client.context.local_addr.clone(),
         };
 
-        match self.transport.send_request(&request).await {
+        match self.peer_client.send_request(&request).await {
             Ok(response_data) => {
                 if let Ok(response) = Communication::deserialize(&response_data) {
                     match response {
