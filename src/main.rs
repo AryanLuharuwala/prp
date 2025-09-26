@@ -350,6 +350,16 @@ impl MessageHandler for FileHandler {
             }
             Communication::FileGet { file_id, peer_addr } => {
                 info!("Received file get request for {} from {}", file_id, peer_addr);
+                debug!("Available files in server context: {:?}", context.files.keys().collect::<Vec<_>>());
+                
+                // Parse target peer from file ID (format: "peer_addr-filename")
+                let target_peer = if let Some(dash_pos) = file_id.find('-') {
+                    file_id[..dash_pos].to_string()
+                } else {
+                    "unknown".to_string()
+                };
+                
+                info!("File request: {} wants file from peer {}", peer_addr, target_peer);
                 
                 if let Some(file_info) = context.files.get(file_id) {
                     // Read the actual file data
@@ -370,13 +380,25 @@ impl MessageHandler for FileHandler {
                         }))
                     }
                 } else {
-                    Ok(Some(Communication::FileGetResponse {
-                        file_id: file_id.clone(),
-                        success: false,
-                        file_data: None,
-                        error_message: Some("File not found".to_string()),
-                        peer_addr: context.local_addr.clone(),
-                    }))
+                    // Check if this is a cross-peer request that should be routed
+                    if target_peer != context.local_addr && target_peer != "unknown" {
+                        warn!("Cross-peer file request: {} -> {} (not implemented - server cannot route to peers)", peer_addr, target_peer);
+                        Ok(Some(Communication::FileGetResponse {
+                            file_id: file_id.clone(),
+                            success: false,
+                            file_data: None,
+                            error_message: Some(format!("File is on peer {} - direct peer-to-peer requests not supported yet", target_peer)),
+                            peer_addr: context.local_addr.clone(),
+                        }))
+                    } else {
+                        Ok(Some(Communication::FileGetResponse {
+                            file_id: file_id.clone(),
+                            success: false,
+                            file_data: None,
+                            error_message: Some("File not found".to_string()),
+                            peer_addr: context.local_addr.clone(),
+                        }))
+                    }
                 }
             }
             _ => Ok(None)
@@ -1512,11 +1534,42 @@ impl UserInterface {
         Ok(())
     }
 
-    /// Scan local files
+    /// Scan local files and announce them to the server
     async fn scan_files(&mut self) -> Result<()> {
         println!("Scanning local files...");
         PeerLifecycleHandler::scan_files(&mut self.peer_client.context)?;
-        println!("Found {} files in local directory", self.peer_client.context.files.len());
+        
+        let file_count = self.peer_client.context.files.len();
+        println!("Found {} files in local directory", file_count);
+        
+        // Announce each file to the server
+        if file_count > 0 {
+            println!("Announcing files to server...");
+            
+            // Collect files first to avoid borrowing conflicts
+            let files_to_announce: Vec<(String, String, u64)> = self.peer_client.context.files
+                .values()
+                .map(|file_info| (file_info.id.clone(), file_info.name.clone(), file_info.size))
+                .collect();
+            
+            for (file_id, file_name, file_size) in files_to_announce {
+                let announcement = Communication::FileAnnounce {
+                    file_id: file_id.clone(),
+                    file_name: file_name.clone(),
+                    file_size,
+                };
+                
+                match self.peer_client.send_request(&announcement).await {
+                    Ok(_) => {
+                        println!("  ✓ Announced: {} ({} bytes)", file_name, file_size);
+                    }
+                    Err(e) => {
+                        println!("  ✗ Failed to announce {}: {}", file_name, e);
+                    }
+                }
+            }
+            println!("File announcements complete.");
+        }
         Ok(())
     }
 
